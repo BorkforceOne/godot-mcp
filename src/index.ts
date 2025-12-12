@@ -29,6 +29,39 @@ const GODOT_DEBUG_MODE: boolean = true; // Always use GODOT DEBUG MODE
 
 const execAsync = promisify(exec);
 
+// Maximum number of runtime errors to keep in buffer (FIFO)
+const MAX_RUNTIME_ERRORS = 100;
+
+// Regular expressions for parsing Godot error output
+const ERROR_PATTERNS = {
+  // Matches: ERROR: <message> or SCRIPT ERROR: <message> or WARNING: <message>
+  errorStart: /^(ERROR|SCRIPT ERROR|WARNING):\s*(.+)$/,
+  // Matches: at: <function> (<script>:<line>) or at: <function> (res://<script>:<line>)
+  atLine: /^\s*at:\s*(\w+)\s*\((?:res:\/\/)?([^:]+):(\d+)\)$/,
+  // Alternative format: at: GDScript::reload (res://path/to/script.gd:28)
+  atLineAlt: /^\s*at:\s*([^\(]+)\s*\(([^:]+):(\d+)\)$/,
+};
+
+/**
+ * Interface representing a parsed runtime error from Godot
+ */
+interface RuntimeError {
+  timestamp: number;
+  type: 'error' | 'warning';
+  message: string;
+  script: string;
+  line: number;
+  function?: string;
+}
+
+/**
+ * Interface for the structured error buffer
+ */
+interface RuntimeErrorBuffer {
+  errors: RuntimeError[];
+  maxSize: number;
+}
+
 // Derive __filename and __dirname in ESM
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -40,6 +73,8 @@ interface GodotProcess {
   process: any;
   output: string[];
   errors: string[];
+  runtimeErrors: RuntimeErrorBuffer;
+  pendingErrorLine: string | null;
 }
 
 /**
@@ -90,6 +125,8 @@ class GodotServer {
     'directory': 'directory',
     'recursive': 'recursive',
     'scene': 'scene',
+    'since_timestamp': 'sinceTimestamp',
+    'clear_after_read': 'clearAfterRead',
   };
 
   /**
@@ -212,6 +249,97 @@ class GodotServer {
 
     // Add more validation as needed
     return true;
+  }
+
+  /**
+   * Parse a stderr line and store structured error if detected
+   * @param line The stderr line to parse
+   * @param buffer The runtime error buffer
+   * @param pendingLine The previous line (if it was an error start without location info)
+   * @returns The new pending line state (null if error was completed, or the line if waiting for location)
+   */
+  private parseAndStoreError(
+    line: string,
+    buffer: RuntimeErrorBuffer,
+    pendingLine: string | null
+  ): string | null {
+    const trimmedLine = line.trim();
+
+    if (!trimmedLine) {
+      return pendingLine;
+    }
+
+    // Check if this is an "at:" line following an error
+    if (pendingLine) {
+      const atMatch = trimmedLine.match(ERROR_PATTERNS.atLine) ||
+                      trimmedLine.match(ERROR_PATTERNS.atLineAlt);
+
+      if (atMatch) {
+        const errorStartMatch = pendingLine.match(ERROR_PATTERNS.errorStart);
+        if (errorStartMatch) {
+          const errorType = errorStartMatch[1].includes('WARNING') ? 'warning' : 'error';
+          const message = errorStartMatch[2];
+          const func = atMatch[1].trim();
+          let script = atMatch[2];
+          const lineNum = parseInt(atMatch[3], 10);
+
+          // Ensure script has res:// prefix
+          if (!script.startsWith('res://')) {
+            script = `res://${script}`;
+          }
+
+          const runtimeError: RuntimeError = {
+            timestamp: Date.now() / 1000, // Unix timestamp in seconds
+            type: errorType,
+            message: message,
+            script: script,
+            line: lineNum,
+            function: func,
+          };
+
+          // FIFO: Remove oldest if at max capacity
+          if (buffer.errors.length >= buffer.maxSize) {
+            buffer.errors.shift();
+          }
+          buffer.errors.push(runtimeError);
+
+          this.logDebug(`Captured runtime ${errorType}: ${message} at ${script}:${lineNum}`);
+          return null; // Clear pending line
+        }
+      }
+
+      // If the next line is not an "at:" line, store the error without location info
+      const errorStartMatch = pendingLine.match(ERROR_PATTERNS.errorStart);
+      if (errorStartMatch) {
+        const errorType = errorStartMatch[1].includes('WARNING') ? 'warning' : 'error';
+        const message = errorStartMatch[2];
+
+        const runtimeError: RuntimeError = {
+          timestamp: Date.now() / 1000,
+          type: errorType,
+          message: message,
+          script: '',
+          line: 0,
+        };
+
+        // FIFO: Remove oldest if at max capacity
+        if (buffer.errors.length >= buffer.maxSize) {
+          buffer.errors.shift();
+        }
+        buffer.errors.push(runtimeError);
+
+        this.logDebug(`Captured runtime ${errorType} (no location): ${message}`);
+      }
+    }
+
+    // Check if this is the start of an error/warning
+    const errorMatch = trimmedLine.match(ERROR_PATTERNS.errorStart);
+    if (errorMatch) {
+      // Store the error type and message, wait for "at:" line
+      return trimmedLine;
+    }
+
+    return null;
   }
 
   /**
@@ -708,6 +836,29 @@ class GodotServer {
           },
         },
         {
+          name: 'get_runtime_errors',
+          description: 'Get runtime errors, warnings, and push_error()/push_warning() calls from the running Godot project',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              since_timestamp: {
+                type: 'number',
+                description: 'Only return errors after this Unix timestamp (optional)',
+              },
+              severity: {
+                type: 'string',
+                enum: ['all', 'error', 'warning'],
+                description: 'Filter by severity level (default: "all")',
+              },
+              clear_after_read: {
+                type: 'boolean',
+                description: 'Clear the error buffer after reading (default: false)',
+              },
+            },
+            required: [],
+          },
+        },
+        {
           name: 'stop_project',
           description: 'Stop the currently running Godot project',
           inputSchema: {
@@ -937,6 +1088,8 @@ class GodotServer {
           return await this.handleRunProject(request.params.arguments);
         case 'get_debug_output':
           return await this.handleGetDebugOutput();
+        case 'get_runtime_errors':
+          return await this.handleGetRuntimeErrors(request.params.arguments);
         case 'stop_project':
           return await this.handleStopProject();
         case 'get_godot_version':
@@ -1098,6 +1251,11 @@ class GodotServer {
       const process = spawn(this.godotPath!, cmdArgs, { stdio: 'pipe' });
       const output: string[] = [];
       const errors: string[] = [];
+      const runtimeErrors: RuntimeErrorBuffer = {
+        errors: [],
+        maxSize: MAX_RUNTIME_ERRORS,
+      };
+      let pendingErrorLine: string | null = null;
 
       process.stdout?.on('data', (data: Buffer) => {
         const lines = data.toString().split('\n');
@@ -1111,7 +1269,11 @@ class GodotServer {
         const lines = data.toString().split('\n');
         errors.push(...lines);
         lines.forEach((line: string) => {
-          if (line.trim()) this.logDebug(`[Godot stderr] ${line}`);
+          if (line.trim()) {
+            this.logDebug(`[Godot stderr] ${line}`);
+            // Parse errors in real-time and update pending line state
+            pendingErrorLine = this.parseAndStoreError(line, runtimeErrors, pendingErrorLine);
+          }
         });
       });
 
@@ -1129,7 +1291,7 @@ class GodotServer {
         }
       });
 
-      this.activeProcess = { process, output, errors };
+      this.activeProcess = { process, output, errors, runtimeErrors, pendingErrorLine };
 
       return {
         content: [
@@ -1178,6 +1340,76 @@ class GodotServer {
             null,
             2
           ),
+        },
+      ],
+    };
+  }
+
+  /**
+   * Handle the get_runtime_errors tool
+   * Returns structured runtime errors with filtering options
+   */
+  private async handleGetRuntimeErrors(args: any) {
+    // Normalize parameters to camelCase
+    args = this.normalizeParameters(args);
+
+    if (!this.activeProcess) {
+      return this.createErrorResponse(
+        'No active Godot process.',
+        [
+          'Use run_project to start a Godot project first',
+          'Check if the Godot process crashed unexpectedly',
+        ]
+      );
+    }
+
+    // Get a copy of errors for filtering
+    let errors = [...this.activeProcess.runtimeErrors.errors];
+
+    // Filter by timestamp if provided
+    if (args.sinceTimestamp !== undefined) {
+      const sinceTimestamp = parseFloat(args.sinceTimestamp);
+      if (!isNaN(sinceTimestamp)) {
+        errors = errors.filter(e => e.timestamp > sinceTimestamp);
+      }
+    }
+
+    // Filter by severity if provided
+    if (args.severity && args.severity !== 'all') {
+      errors = errors.filter(e => e.type === args.severity);
+    }
+
+    // Count errors and warnings
+    const errorCount = errors.filter(e => e.type === 'error').length;
+    const warningCount = errors.filter(e => e.type === 'warning').length;
+
+    // Clear buffer after read if requested
+    if (args.clearAfterRead === true) {
+      this.activeProcess.runtimeErrors.errors = [];
+    }
+
+    // Format errors with human-readable timestamps
+    const formattedErrors = errors.map(e => ({
+      ...e,
+      time: new Date(e.timestamp * 1000).toLocaleTimeString('en-US', {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: true,
+      }),
+    }));
+
+    const response = {
+      errors: formattedErrors,
+      error_count: errorCount,
+      warning_count: warningCount,
+    };
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(response, null, 2),
         },
       ],
     };
