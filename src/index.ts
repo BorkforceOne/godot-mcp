@@ -9,7 +9,7 @@
 
 import { fileURLToPath } from 'url';
 import { join, dirname, basename, normalize } from 'path';
-import { existsSync, readdirSync, mkdirSync } from 'fs';
+import { existsSync, readdirSync, mkdirSync, readFileSync } from 'fs';
 import { spawn } from 'child_process';
 import { promisify } from 'util';
 import { exec } from 'child_process';
@@ -930,6 +930,26 @@ class GodotServer {
           },
         },
         {
+          name: 'get_project_settings',
+          description: 'Get project configuration settings (display, physics, autoloads, input, rendering)',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              category: {
+                type: 'string',
+                description: 'Filter by settings category',
+                enum: ['all', 'display', 'physics', 'input', 'autoload', 'rendering', 'application'],
+                default: 'all',
+              },
+            },
+            required: ['projectPath'],
+          },
+        },
+        {
           name: 'create_scene',
           description: 'Create a new Godot scene file',
           inputSchema: {
@@ -1252,6 +1272,8 @@ class GodotServer {
           return await this.handleListProjects(request.params.arguments);
         case 'get_project_info':
           return await this.handleGetProjectInfo(request.params.arguments);
+        case 'get_project_settings':
+          return await this.handleGetProjectSettings(request.params.arguments);
         case 'create_scene':
           return await this.handleCreateScene(request.params.arguments);
         case 'add_node':
@@ -1878,13 +1900,386 @@ class GodotServer {
     }
   }
 
+  // ============================================
+  // Project Settings Parsing Helpers
+  // ============================================
+
+  /**
+   * Interface for parsed Godot config sections
+   */
+  private parseGodotConfig(content: string): Record<string, Record<string, string>> {
+    const result: Record<string, Record<string, string>> = {};
+    let currentSection = 'root';
+
+    const lines = content.split('\n');
+    let i = 0;
+
+    while (i < lines.length) {
+      let line = lines[i].trim();
+
+      // Skip empty lines and comments
+      if (!line || line.startsWith(';')) {
+        i++;
+        continue;
+      }
+
+      // Section header
+      if (line.startsWith('[') && line.endsWith(']')) {
+        currentSection = line.slice(1, -1);
+        if (!result[currentSection]) {
+          result[currentSection] = {};
+        }
+        i++;
+        continue;
+      }
+
+      // Key=value pair (may span multiple lines for complex values)
+      const eqIndex = line.indexOf('=');
+      if (eqIndex > 0) {
+        const key = line.slice(0, eqIndex);
+        let value = line.slice(eqIndex + 1);
+
+        // Handle multi-line values (objects, arrays with braces)
+        if (value.includes('{') && !value.includes('}')) {
+          while (i + 1 < lines.length && !lines[i].includes('}')) {
+            i++;
+            value += '\n' + lines[i];
+          }
+        }
+
+        if (!result[currentSection]) {
+          result[currentSection] = {};
+        }
+        result[currentSection][key] = value;
+      }
+
+      i++;
+    }
+
+    return result;
+  }
+
+  /**
+   * Parse a Godot value string into a JavaScript value
+   */
+  private parseGodotValue(value: string): any {
+    if (!value) return value;
+
+    // Remove quotes from strings
+    if (value.startsWith('"') && value.endsWith('"')) {
+      return value.slice(1, -1);
+    }
+
+    // Parse numbers
+    if (/^-?\d+(\.\d+)?$/.test(value)) {
+      return parseFloat(value);
+    }
+
+    // Parse booleans
+    if (value === 'true') return true;
+    if (value === 'false') return false;
+
+    // Parse Vector2
+    const vec2Match = value.match(/Vector2\s*\(\s*([^,]+)\s*,\s*([^)]+)\s*\)/);
+    if (vec2Match) {
+      return { x: parseFloat(vec2Match[1]), y: parseFloat(vec2Match[2]) };
+    }
+
+    // Parse Vector3
+    const vec3Match = value.match(/Vector3\s*\(\s*([^,]+)\s*,\s*([^,]+)\s*,\s*([^)]+)\s*\)/);
+    if (vec3Match) {
+      return {
+        x: parseFloat(vec3Match[1]),
+        y: parseFloat(vec3Match[2]),
+        z: parseFloat(vec3Match[3])
+      };
+    }
+
+    return value;
+  }
+
+  /**
+   * Convert Godot keycode to readable string
+   */
+  private keycodeToString(keycode: number): string {
+    const keycodeMap: Record<number, string> = {
+      32: 'Space',
+      65: 'A', 66: 'B', 67: 'C', 68: 'D', 69: 'E', 70: 'F', 71: 'G', 72: 'H',
+      73: 'I', 74: 'J', 75: 'K', 76: 'L', 77: 'M', 78: 'N', 79: 'O', 80: 'P',
+      81: 'Q', 82: 'R', 83: 'S', 84: 'T', 85: 'U', 86: 'V', 87: 'W', 88: 'X',
+      89: 'Y', 90: 'Z',
+      48: '0', 49: '1', 50: '2', 51: '3', 52: '4', 53: '5', 54: '6', 55: '7', 56: '8', 57: '9',
+      4194319: 'Left', 4194320: 'Up', 4194321: 'Right', 4194322: 'Down',
+      4194309: 'Enter', 4194305: 'Escape', 4194306: 'Tab', 4194308: 'Backspace',
+      4194325: 'Shift', 4194326: 'Ctrl', 4194327: 'Alt',
+      4194328: 'Meta', 4194329: 'CapsLock', 4194330: 'NumLock', 4194331: 'ScrollLock',
+      4194332: 'F1', 4194333: 'F2', 4194334: 'F3', 4194335: 'F4',
+      4194336: 'F5', 4194337: 'F6', 4194338: 'F7', 4194339: 'F8',
+      4194340: 'F9', 4194341: 'F10', 4194342: 'F11', 4194343: 'F12',
+    };
+    return keycodeMap[keycode] || `Key_${keycode}`;
+  }
+
+  /**
+   * Extract application settings from config
+   */
+  private getApplicationSettings(config: Record<string, Record<string, string>>): object {
+    const app = config['application'] || {};
+    return {
+      name: this.parseGodotValue(app['config/name'] || '""'),
+      version: this.parseGodotValue(app['config/version'] || '"1.0.0"'),
+      main_scene: this.parseGodotValue(app['run/main_scene'] || '""'),
+    };
+  }
+
+  /**
+   * Extract display settings from config
+   */
+  private getDisplaySettings(config: Record<string, Record<string, string>>): object {
+    const display = config['display'] || {};
+    return {
+      width: this.parseGodotValue(display['window/size/viewport_width'] || '1152'),
+      height: this.parseGodotValue(display['window/size/viewport_height'] || '648'),
+      fullscreen: this.parseGodotValue(display['window/mode'] || '0') === 3,
+      vsync: (this.parseGodotValue(display['window/vsync/vsync_mode'] || '1') as number) > 0,
+      stretch_mode: this.parseGodotValue(display['window/stretch/mode'] || '"disabled"'),
+      stretch_aspect: this.parseGodotValue(display['window/stretch/aspect'] || '"keep"'),
+    };
+  }
+
+  /**
+   * Extract autoload settings from config
+   */
+  private getAutoloadSettings(config: Record<string, Record<string, string>>): object[] {
+    const autoload = config['autoload'] || {};
+    return Object.entries(autoload).map(([name, pathValue]) => {
+      let cleanPath = this.parseGodotValue(pathValue);
+      // Remove "*" prefix (indicates singleton)
+      if (typeof cleanPath === 'string' && cleanPath.startsWith('*')) {
+        cleanPath = cleanPath.slice(1);
+      }
+      return { name, path: cleanPath };
+    });
+  }
+
+  /**
+   * Extract physics settings including layer names from config
+   */
+  private getPhysicsSettings(config: Record<string, Record<string, string>>): object {
+    const physics = config['physics'] || {};
+    const layerNames = config['layer_names'] || {};
+
+    // Collect layer names
+    const layers: Record<string, string[]> = {
+      '2d_physics': [],
+      '2d_render': [],
+      '3d_physics': [],
+      '3d_render': [],
+    };
+
+    for (const [key, value] of Object.entries(layerNames)) {
+      for (const layerType of Object.keys(layers)) {
+        if (key.startsWith(layerType + '/layer_')) {
+          const name = this.parseGodotValue(value);
+          if (name && typeof name === 'string') {
+            layers[layerType].push(name);
+          }
+        }
+      }
+    }
+
+    return {
+      '2d': {
+        default_gravity: this.parseGodotValue(physics['2d/default_gravity'] || '980'),
+        default_gravity_vector: this.parseGodotValue(
+          physics['2d/default_gravity_vector'] || 'Vector2(0, 1)'
+        ),
+      },
+      '3d': {
+        default_gravity: this.parseGodotValue(physics['3d/default_gravity'] || '9.8'),
+        default_gravity_vector: this.parseGodotValue(
+          physics['3d/default_gravity_vector'] || 'Vector3(0, -1, 0)'
+        ),
+      },
+      layer_names: layers,
+    };
+  }
+
+  /**
+   * Extract input action settings from config
+   */
+  private getInputSettings(config: Record<string, Record<string, string>>): object {
+    const input = config['input'] || {};
+    const result: Record<string, object[]> = {};
+
+    for (const [action, value] of Object.entries(input)) {
+      const events: object[] = [];
+
+      // Parse InputEventKey objects - try keycode first, then physical_keycode
+      const keyMatches = value.matchAll(/InputEventKey[^)]*?"keycode"\s*:\s*(\d+)/g);
+      for (const match of keyMatches) {
+        const keycode = parseInt(match[1]);
+        if (keycode !== 0) {
+          events.push({
+            type: 'key',
+            keycode: this.keycodeToString(keycode),
+          });
+        }
+      }
+
+      // Also check for physical_keycode if keycode was 0
+      const physKeyMatches = value.matchAll(/InputEventKey[^)]*?"physical_keycode"\s*:\s*(\d+)/g);
+      for (const match of physKeyMatches) {
+        const keycode = parseInt(match[1]);
+        if (keycode !== 0) {
+          // Check if we already have this event
+          const exists = events.some((e: any) => e.type === 'key' && e.keycode === this.keycodeToString(keycode));
+          if (!exists) {
+            events.push({
+              type: 'key',
+              keycode: this.keycodeToString(keycode),
+            });
+          }
+        }
+      }
+
+      // Parse InputEventMouseButton
+      const mouseMatches = value.matchAll(/InputEventMouseButton[^)]*?"button_index"\s*:\s*(\d+)/g);
+      for (const match of mouseMatches) {
+        events.push({
+          type: 'mouse_button',
+          button: parseInt(match[1]),
+        });
+      }
+
+      // Parse InputEventJoypadButton
+      const joyMatches = value.matchAll(/InputEventJoypadButton[^)]*?"button_index"\s*:\s*(\d+)/g);
+      for (const match of joyMatches) {
+        events.push({
+          type: 'joypad_button',
+          button: parseInt(match[1]),
+        });
+      }
+
+      // Parse InputEventJoypadMotion
+      const joyAxisMatches = value.matchAll(/InputEventJoypadMotion[^)]*?"axis"\s*:\s*(\d+)/g);
+      for (const match of joyAxisMatches) {
+        events.push({
+          type: 'joypad_axis',
+          axis: parseInt(match[1]),
+        });
+      }
+
+      if (events.length > 0) {
+        result[action] = events;
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * Extract rendering settings from config
+   */
+  private getRenderingSettings(config: Record<string, Record<string, string>>): object {
+    const rendering = config['rendering'] || {};
+    return {
+      renderer: this.parseGodotValue(
+        rendering['renderer/rendering_method'] || '"forward_plus"'
+      ),
+      anti_aliasing: {
+        msaa_2d: this.parseGodotValue(rendering['anti_aliasing/quality/msaa_2d'] || '0'),
+        msaa_3d: this.parseGodotValue(rendering['anti_aliasing/quality/msaa_3d'] || '0'),
+      },
+    };
+  }
+
+  /**
+   * Handle the get_project_settings tool
+   */
+  private async handleGetProjectSettings(args: any) {
+    // Normalize parameters to camelCase
+    args = this.normalizeParameters(args);
+
+    if (!args.projectPath) {
+      return this.createErrorResponse(
+        'Project path is required',
+        ['Provide a valid path to a Godot project directory']
+      );
+    }
+
+    if (!this.validatePath(args.projectPath)) {
+      return this.createErrorResponse(
+        'Invalid project path',
+        ['Provide a valid path without ".." or other potentially unsafe characters']
+      );
+    }
+
+    try {
+      const projectGodotPath = join(args.projectPath, 'project.godot');
+
+      // Verify file exists
+      if (!existsSync(projectGodotPath)) {
+        return this.createErrorResponse(
+          `project.godot not found at: ${projectGodotPath}`,
+          [
+            'Ensure the path points to a directory containing a project.godot file',
+            'Use list_projects to find valid Godot projects',
+          ]
+        );
+      }
+
+      const content = readFileSync(projectGodotPath, 'utf-8');
+      const config = this.parseGodotConfig(content);
+
+      const settings: Record<string, any> = {};
+      const category = args.category || 'all';
+
+      if (category === 'all' || category === 'application') {
+        settings.application = this.getApplicationSettings(config);
+      }
+      if (category === 'all' || category === 'display') {
+        settings.display = this.getDisplaySettings(config);
+      }
+      if (category === 'all' || category === 'physics') {
+        settings.physics = this.getPhysicsSettings(config);
+      }
+      if (category === 'all' || category === 'autoload') {
+        settings.autoloads = this.getAutoloadSettings(config);
+      }
+      if (category === 'all' || category === 'input') {
+        settings.input = this.getInputSettings(config);
+      }
+      if (category === 'all' || category === 'rendering') {
+        settings.rendering = this.getRenderingSettings(config);
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({ settings }, null, 2),
+          },
+        ],
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to get project settings: ${error?.message || 'Unknown error'}`,
+        [
+          'Verify the project path is accessible',
+          'Ensure project.godot file is not corrupted',
+        ]
+      );
+    }
+  }
+
   /**
    * Handle the create_scene tool
    */
   private async handleCreateScene(args: any) {
     // Normalize parameters to camelCase
     args = this.normalizeParameters(args);
-    
+
     if (!args.projectPath || !args.scenePath) {
       return this.createErrorResponse(
         'Project path and scene path are required',
