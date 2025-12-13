@@ -8,7 +8,12 @@
       "Bash(node:*)",
       "Bash(git -C /c/Users/logan/Documents/GitHub/godot-mcp log --oneline -10)",
       "Bash(git -C /c/Users/logan/Documents/GitHub/godot-mcp show 43f5490 --stat)",
-      "Bash(cat:*)"
+      "Bash(cat:*)",
+      "Bash(wc:*)",
+      "Bash(git -C /c/Users/logan/Documents/GitHub/godot-mcp show:*)",
+      "Bash(git -C /c/Users/logan/Documents/GitHub/godot-mcp log --all --oneline --grep=\"input\" -i)",
+      "Bash(find:*)",
+      "Bash(grep:*)"
     ]
   }
 }

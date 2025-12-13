@@ -945,6 +945,11 @@ class GodotServer {
                 enum: ['all', 'display', 'physics', 'input', 'autoload', 'rendering', 'application'],
                 default: 'all',
               },
+              includeBuiltinInput: {
+                type: 'boolean',
+                description: 'Include built-in ui_* input actions (default: true)',
+                default: true,
+              },
             },
             required: ['projectPath'],
           },
@@ -2108,70 +2113,100 @@ class GodotServer {
   /**
    * Extract input action settings from config
    */
-  private getInputSettings(config: Record<string, Record<string, string>>): object {
+  private getInputSettings(
+    config: Record<string, Record<string, string>>,
+    includeBuiltin: boolean = true
+  ): object {
     const input = config['input'] || {};
-    const result: Record<string, object[]> = {};
+    const result: Record<string, { deadzone: number; events: object[] }> = {};
 
     for (const [action, value] of Object.entries(input)) {
-      const events: object[] = [];
-
-      // Parse InputEventKey objects - try keycode first, then physical_keycode
-      const keyMatches = value.matchAll(/InputEventKey[^)]*?"keycode"\s*:\s*(\d+)/g);
-      for (const match of keyMatches) {
-        const keycode = parseInt(match[1]);
-        if (keycode !== 0) {
-          events.push({
-            type: 'key',
-            keycode: this.keycodeToString(keycode),
-          });
-        }
+      // Filter built-in ui_* actions if requested
+      if (!includeBuiltin && action.startsWith('ui_')) {
+        continue;
       }
 
-      // Also check for physical_keycode if keycode was 0
-      const physKeyMatches = value.matchAll(/InputEventKey[^)]*?"physical_keycode"\s*:\s*(\d+)/g);
-      for (const match of physKeyMatches) {
-        const keycode = parseInt(match[1]);
+      const events: object[] = [];
+
+      // Extract deadzone value (0.5 is Godot's default)
+      const deadzoneMatch = value.match(/"deadzone"\s*:\s*([\d.]+)/);
+      const deadzone = deadzoneMatch ? parseFloat(deadzoneMatch[1]) : 0.5;
+
+      // Parse InputEventKey objects with modifier keys
+      // Match each InputEventKey block individually to extract its modifiers and keycode
+      const keyEventRegex = /Object\(InputEventKey[^)]*\)/g;
+      const keyEvents = value.match(keyEventRegex) || [];
+
+      for (const keyEvent of keyEvents) {
+        // Extract modifier states
+        const altMatch = keyEvent.match(/"alt_pressed"\s*:\s*(true|false)/);
+        const shiftMatch = keyEvent.match(/"shift_pressed"\s*:\s*(true|false)/);
+        const ctrlMatch = keyEvent.match(/"ctrl_pressed"\s*:\s*(true|false)/);
+        const metaMatch = keyEvent.match(/"meta_pressed"\s*:\s*(true|false)/);
+
+        // Extract keycode (try keycode first, then physical_keycode)
+        const keycodeMatch = keyEvent.match(/"keycode"\s*:\s*(\d+)/);
+        const physKeycodeMatch = keyEvent.match(/"physical_keycode"\s*:\s*(\d+)/);
+
+        let keycode = keycodeMatch ? parseInt(keycodeMatch[1]) : 0;
+        if (keycode === 0 && physKeycodeMatch) {
+          keycode = parseInt(physKeycodeMatch[1]);
+        }
+
         if (keycode !== 0) {
-          // Check if we already have this event
-          const exists = events.some((e: any) => e.type === 'key' && e.keycode === this.keycodeToString(keycode));
+          const keycodeStr = this.keycodeToString(keycode);
+          // Check if we already have this exact event (same keycode and modifiers)
+          const exists = events.some(
+            (e: any) => e.type === 'key' && e.keycode === keycodeStr
+          );
           if (!exists) {
             events.push({
               type: 'key',
-              keycode: this.keycodeToString(keycode),
+              keycode: keycodeStr,
+              ctrl: ctrlMatch ? ctrlMatch[1] === 'true' : false,
+              shift: shiftMatch ? shiftMatch[1] === 'true' : false,
+              alt: altMatch ? altMatch[1] === 'true' : false,
+              meta: metaMatch ? metaMatch[1] === 'true' : false,
             });
           }
         }
       }
 
-      // Parse InputEventMouseButton
-      const mouseMatches = value.matchAll(/InputEventMouseButton[^)]*?"button_index"\s*:\s*(\d+)/g);
-      for (const match of mouseMatches) {
+      // Parse InputEventMouseButton - extract button_index that follows InputEventMouseButton
+      const mouseButtonRegex = /InputEventMouseButton[^]*?"button_index"\s*:\s*(\d+)/g;
+      let mouseMatch;
+      while ((mouseMatch = mouseButtonRegex.exec(value)) !== null) {
         events.push({
           type: 'mouse_button',
-          button: parseInt(match[1]),
+          button: parseInt(mouseMatch[1]),
         });
       }
 
-      // Parse InputEventJoypadButton
-      const joyMatches = value.matchAll(/InputEventJoypadButton[^)]*?"button_index"\s*:\s*(\d+)/g);
-      for (const match of joyMatches) {
+      // Parse InputEventJoypadButton - extract button_index that follows InputEventJoypadButton
+      const joyButtonRegex = /InputEventJoypadButton[^]*?"button_index"\s*:\s*(\d+)/g;
+      let joyButtonMatch;
+      while ((joyButtonMatch = joyButtonRegex.exec(value)) !== null) {
         events.push({
           type: 'joypad_button',
-          button: parseInt(match[1]),
+          button: parseInt(joyButtonMatch[1]),
         });
       }
 
-      // Parse InputEventJoypadMotion
-      const joyAxisMatches = value.matchAll(/InputEventJoypadMotion[^)]*?"axis"\s*:\s*(\d+)/g);
-      for (const match of joyAxisMatches) {
+      // Parse InputEventJoypadMotion - extract axis that follows InputEventJoypadMotion
+      const joyAxisRegex = /InputEventJoypadMotion[^]*?"axis"\s*:\s*(\d+)/g;
+      let joyAxisMatch;
+      while ((joyAxisMatch = joyAxisRegex.exec(value)) !== null) {
         events.push({
           type: 'joypad_axis',
-          axis: parseInt(match[1]),
+          axis: parseInt(joyAxisMatch[1]),
         });
       }
 
       if (events.length > 0) {
-        result[action] = events;
+        result[action] = {
+          deadzone,
+          events,
+        };
       }
     }
 
@@ -2248,7 +2283,7 @@ class GodotServer {
         settings.autoloads = this.getAutoloadSettings(config);
       }
       if (category === 'all' || category === 'input') {
-        settings.input = this.getInputSettings(config);
+        settings.input = this.getInputSettings(config, args.includeBuiltinInput !== false);
       }
       if (category === 'all' || category === 'rendering') {
         settings.rendering = this.getRenderingSettings(config);
