@@ -13,7 +13,11 @@
       "Bash(git -C /c/Users/logan/Documents/GitHub/godot-mcp show:*)",
       "Bash(git -C /c/Users/logan/Documents/GitHub/godot-mcp log --all --oneline --grep=\"input\" -i)",
       "Bash(find:*)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(\"%GODOT_PATH%\" --headless --path \"C:\\Users\\logan\\Documents\\godot projects\\signal_test\" --check-only --script \"res://test_invalid.gd\")",
+      "Bash(where:*)",
+      "Bash(dir:*)",
+      "Bash(\"C:\\Users\\logan\\Desktop\\Godot_v4.5.1-stable_win64.exe\" --headless --path \"C:\\Users\\logan\\Documents\\godot projects\\signal_test\" --check-only --script \"res://test_invalid.gd\")"
     ]
   }
 }

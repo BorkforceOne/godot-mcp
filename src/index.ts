@@ -148,6 +148,8 @@ class GodotServer {
     'max_depth': 'maxDepth',
     'dap_port': 'dapPort',
     'bridge_port': 'bridgePort',
+    // Validation tool parameters
+    'script_path': 'scriptPath',
   };
 
   /**
@@ -459,8 +461,22 @@ class GodotServer {
         'C:\\Program Files (x86)\\Godot\\Godot.exe',
         'C:\\Program Files\\Godot_4\\Godot.exe',
         'C:\\Program Files (x86)\\Godot_4\\Godot.exe',
-        `${process.env.USERPROFILE}\\Godot\\Godot.exe`
+        `${process.env.USERPROFILE}\\Godot\\Godot.exe`,
+        `${process.env.USERPROFILE}\\Desktop\\Godot.exe`,
       );
+
+      // Also search Desktop for Godot_v*.exe files (portable installations)
+      try {
+        const desktopPath = `${process.env.USERPROFILE}\\Desktop`;
+        const desktopFiles = readdirSync(desktopPath);
+        for (const file of desktopFiles) {
+          if (file.toLowerCase().startsWith('godot') && file.toLowerCase().endsWith('.exe')) {
+            possiblePaths.push(join(desktopPath, file));
+          }
+        }
+      } catch (e) {
+        // Ignore errors reading desktop
+      }
     } else if (osPlatform === 'linux') {
       possiblePaths.push(
         '/usr/bin/godot',
@@ -1254,6 +1270,25 @@ class GodotServer {
             required: [],
           },
         },
+        // Validation tools
+        {
+          name: 'validate_script',
+          description: 'Validate GDScript syntax and return any parse errors with line numbers. Uses Godot headless mode with --check-only flag.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              scriptPath: {
+                type: 'string',
+                description: 'Path to script file (absolute or res:// format)',
+              },
+            },
+            required: ['projectPath', 'scriptPath'],
+          },
+        },
       ],
     }));
 
@@ -1308,6 +1343,9 @@ class GodotServer {
           return await this.handleGetSignals(request.params.arguments);
         case 'get_signal_connections':
           return await this.handleGetSignalConnections(request.params.arguments);
+        // Validation tools
+        case 'validate_script':
+          return await this.handleValidateScript(request.params.arguments);
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
@@ -3652,6 +3690,277 @@ class GodotServer {
     } catch (err) {
       return variable.value;
     }
+  }
+
+  /**
+   * Handle the validate_script tool
+   * Validates GDScript syntax using Godot's --check-only flag
+   * @param args Tool arguments
+   */
+  private async handleValidateScript(args: any) {
+    // Normalize parameters to camelCase
+    args = this.normalizeParameters(args);
+
+    if (!args.projectPath) {
+      return this.createErrorResponse(
+        'Project path is required',
+        ['Provide a valid path to a Godot project directory']
+      );
+    }
+
+    if (!args.scriptPath) {
+      return this.createErrorResponse(
+        'Script path is required',
+        ['Provide a path to a GDScript file (absolute or res:// format)']
+      );
+    }
+
+    if (!this.validatePath(args.projectPath)) {
+      return this.createErrorResponse(
+        'Invalid project path',
+        ['Provide a valid path without ".." or other potentially unsafe characters']
+      );
+    }
+
+    // Check if the project directory exists and contains a project.godot file
+    const projectFile = join(args.projectPath, 'project.godot');
+    if (!existsSync(projectFile)) {
+      return this.createErrorResponse(
+        `Not a valid Godot project: ${args.projectPath}`,
+        [
+          'Ensure the path points to a directory containing a project.godot file',
+          'Use list_projects to find valid Godot projects',
+        ]
+      );
+    }
+
+    // Convert script path to res:// format and absolute path
+    let resPath = args.scriptPath;
+    let absolutePath = args.scriptPath;
+
+    if (args.scriptPath.startsWith('res://')) {
+      // Convert res:// to absolute for file existence check
+      absolutePath = join(args.projectPath, args.scriptPath.replace('res://', ''));
+    } else if (args.scriptPath.startsWith('/') || args.scriptPath.match(/^[A-Za-z]:/)) {
+      // Absolute path - convert to res://
+      const normalizedProjectPath = normalize(args.projectPath);
+      const normalizedScriptPath = normalize(args.scriptPath);
+
+      if (normalizedScriptPath.startsWith(normalizedProjectPath)) {
+        const relativePath = normalizedScriptPath.substring(normalizedProjectPath.length);
+        resPath = 'res://' + relativePath.replace(/\\/g, '/').replace(/^\//, '');
+      } else {
+        return this.createErrorResponse(
+          'Script path must be within the project directory',
+          ['Provide a script path that is inside the project directory']
+        );
+      }
+    } else {
+      // Relative path - assume relative to project
+      absolutePath = join(args.projectPath, args.scriptPath);
+      resPath = 'res://' + args.scriptPath.replace(/\\/g, '/');
+    }
+
+    // Check if script file exists
+    if (!existsSync(absolutePath)) {
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            valid: false,
+            script_path: resPath,
+            errors: [{ line: 0, column: 0, message: `File not found: ${absolutePath}` }]
+          }, null, 2),
+        }],
+      };
+    }
+
+    // Check if it's a .gd file
+    if (!absolutePath.toLowerCase().endsWith('.gd')) {
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            valid: false,
+            script_path: resPath,
+            errors: [{ line: 0, column: 0, message: 'Not a GDScript file (.gd)' }]
+          }, null, 2),
+        }],
+      };
+    }
+
+    // Ensure godotPath is set
+    if (!this.godotPath) {
+      await this.detectGodotPath();
+      if (!this.godotPath) {
+        return this.createErrorResponse(
+          'Could not find a valid Godot executable path',
+          [
+            'Set the GODOT_PATH environment variable',
+            'Install Godot and ensure it is in your PATH',
+          ]
+        );
+      }
+    }
+
+    try {
+      // Run Godot with --check-only flag
+      const isWindows = process.platform === 'win32';
+      const cmd = [
+        `"${this.godotPath}"`,
+        '--headless',
+        '--path', `"${args.projectPath}"`,
+        '--check-only',
+        '--script', `"${resPath}"`,
+      ].join(' ');
+
+      this.logDebug(`Validating script with command: ${cmd}`);
+
+      let stdout = '';
+      let stderr = '';
+
+      try {
+        const result = await execAsync(cmd, { timeout: 30000 });
+        stdout = result.stdout;
+        stderr = result.stderr;
+      } catch (execError: any) {
+        // execAsync throws on non-zero exit code, but we still get stdout/stderr
+        stdout = execError.stdout || '';
+        stderr = execError.stderr || '';
+      }
+
+      // Parse errors from combined output
+      const combinedOutput = stderr + '\n' + stdout;
+      const errors = this.parseValidationErrors(combinedOutput, resPath);
+
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            valid: errors.length === 0,
+            script_path: resPath,
+            errors: errors,
+          }, null, 2),
+        }],
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to validate script: ${error?.message || 'Unknown error'}`,
+        [
+          'Ensure Godot is installed correctly',
+          'Check if the GODOT_PATH environment variable is set correctly',
+          'Verify the script path is accessible',
+        ]
+      );
+    }
+  }
+
+  /**
+   * Parse Godot's error output into structured error objects
+   * @param output The combined stdout/stderr output from Godot
+   * @param scriptPath The res:// path of the script being validated
+   * @returns Array of error objects with line, column, and message
+   */
+  private parseValidationErrors(output: string, scriptPath: string): Array<{ line: number; column: number; message: string }> {
+    const errors: Array<{ line: number; column: number; message: string }> = [];
+    // Handle both Unix (\n) and Windows (\r\n) line endings
+    const lines = output.replace(/\r\n/g, '\n').split('\n');
+
+    // Get the script filename for matching
+    const scriptName = scriptPath.replace('res://', '').split('/').pop() || '';
+
+    // Godot 4.x outputs errors in a two-line format:
+    // Line 1: SCRIPT ERROR: Parse Error: <message>
+    // Line 2:    at: <function> (res://script.gd:line)
+    // Or:
+    // Line 1: ERROR: <message>
+    // Line 2:    at: <function> (res://script.gd:line)
+
+    // Pattern for error start lines
+    const errorStartPattern = /^(SCRIPT ERROR|ERROR|WARNING):\s*(?:Parse Error:\s*)?(.+)$/i;
+
+    // Pattern for "at:" lines with location info
+    // Matches: "   at: GDScript::reload (res://test_invalid.gd:4)"
+    // Or: "   at: load (modules/gdscript/gdscript.cpp:3041)"
+    // Note: file path can contain colons (e.g., res://path), so we match greedily and rely on the last :number) pattern
+    const atLinePattern = /^\s*at:\s*([^\(]+)\s*\((.+):(\d+)\)$/;
+
+    // Track pending error message waiting for location
+    let pendingMessage: string | null = null;
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const trimmedLine = line.trim();
+      if (!trimmedLine) continue;
+
+      // Check for error start
+      const errorMatch = trimmedLine.match(errorStartPattern);
+      if (errorMatch) {
+        // Save the message, wait for "at:" line
+        pendingMessage = errorMatch[2].trim();
+        continue;
+      }
+
+      // Check for "at:" line following an error
+      const atMatch = line.match(atLinePattern);
+      if (atMatch && pendingMessage) {
+        const [, func, file, lineStr] = atMatch;
+        const lineNum = parseInt(lineStr, 10);
+
+        // Check if this error is for our script (not internal Godot files)
+        const isOurScript =
+          file.includes(scriptPath) ||
+          file.includes(scriptPath.replace('res://', '')) ||
+          file.endsWith(scriptName) ||
+          file.startsWith('res://');
+
+        // Skip errors from internal Godot files (like modules/gdscript/...)
+        const isInternalFile = file.includes('modules/') || file.includes('.cpp');
+
+        if (isOurScript && !isInternalFile) {
+          errors.push({
+            line: lineNum,
+            column: 1,
+            message: pendingMessage,
+          });
+        }
+
+        pendingMessage = null;
+        continue;
+      }
+
+      // Also try single-line patterns for other formats
+      // Pattern: res://script.gd:15 - Parse Error: message
+      const singleLinePattern = /^(?:SCRIPT ERROR:\s*)?(res:\/\/[^:]+):(\d+)(?::(\d+))?\s*[-:]\s*(?:Parse Error:\s*)?(.+)$/i;
+      const singleMatch = trimmedLine.match(singleLinePattern);
+      if (singleMatch) {
+        const [, file, lineStr, colStr, msg] = singleMatch;
+
+        const matchesScript =
+          file.includes(scriptPath) ||
+          file.includes(scriptPath.replace('res://', '')) ||
+          file.endsWith(scriptName);
+
+        if (matchesScript) {
+          errors.push({
+            line: parseInt(lineStr, 10),
+            column: colStr ? parseInt(colStr, 10) : 1,
+            message: msg.trim(),
+          });
+        }
+
+        pendingMessage = null;
+      }
+    }
+
+    // Deduplicate errors (same line + message)
+    const seen = new Set<string>();
+    return errors.filter(err => {
+      const key = `${err.line}:${err.message}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
   }
 
   /**
