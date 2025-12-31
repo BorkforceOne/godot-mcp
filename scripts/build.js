@@ -22,13 +22,13 @@ try {
 
   console.log('Successfully copied godot_operations.gd to build/scripts');
 
-  // Copy the screenshot_capture.gd file
+  // Copy the mcp_runtime_bridge.gd file
   fs.copyFileSync(
-    path.join(__dirname, '..', 'src', 'scripts', 'screenshot_capture.gd'),
-    path.join(__dirname, '..', 'build', 'scripts', 'screenshot_capture.gd')
+    path.join(__dirname, '..', 'src', 'scripts', 'mcp_runtime_bridge.gd'),
+    path.join(__dirname, '..', 'build', 'scripts', 'mcp_runtime_bridge.gd')
   );
 
-  console.log('Successfully copied screenshot_capture.gd to build/scripts');
+  console.log('Successfully copied mcp_runtime_bridge.gd to build/scripts');
 } catch (error) {
   console.error('Error copying scripts:', error);
   process.exit(1);

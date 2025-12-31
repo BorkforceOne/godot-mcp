@@ -85,6 +85,7 @@ interface GodotProcess {
   runtimeErrors: RuntimeErrorBuffer;
   pendingErrorLine: string | null;
   debugMessages: DebugMessage[];
+  injectedAutoload: InjectedAutoload | null;
 }
 
 /**
@@ -107,6 +108,7 @@ interface InjectedAutoload {
   scriptPath: string;           // Path to copied script in project
   projectGodotPath: string;     // Path to project.godot
   projectGodotBackup: string;   // Backup of original project.godot content
+  destScriptBase: string;       // Basename of the injected script
 }
 
 /**
@@ -143,8 +145,6 @@ class GodotServer {
   private bridgePort: number = 6008;
   private dapPort: number = 6006;
 
-  // Screenshot autoload injection state
-  private injectedAutoload: InjectedAutoload | null = null;
 
   /**
    * Parameter name mappings between snake_case and camelCase
@@ -301,81 +301,104 @@ class GodotServer {
   }
 
   /**
-   * Inject the screenshot capture AutoLoad into a project
+   * Inject the runtime bridge AutoLoad into a project
    * @param projectPath Path to the Godot project
    */
-  private injectScreenshotAutoload(projectPath: string): void {
+  private injectRuntimeAutoload(projectPath: string): InjectedAutoload | null {
     try {
       // Source script path (bundled with the MCP server)
-      const sourceScript = join(__dirname, 'scripts', 'screenshot_capture.gd');
+      const sourceScript = join(__dirname, 'scripts', 'mcp_runtime_bridge.gd');
 
       // Destination in the project (use underscore prefix to indicate MCP-managed)
-      const destScript = join(projectPath, '_mcp_screenshot_capture.gd');
+      const destScriptBase = '_mcp_runtime_bridge.gd';
+      const destScript = join(projectPath, destScriptBase);
 
       // Copy the script to the project
       copyFileSync(sourceScript, destScript);
-      this.logDebug(`Copied screenshot capture script to ${destScript}`);
+      this.logDebug(`Copied runtime bridge script to ${destScript}`);
+
+      // Clean up any existing UID file to ensure Godot re-indexes it (Godot 4.4+)
+      const uidFile = destScript + '.uid';
+      if (existsSync(uidFile)) {
+        try {
+          unlinkSync(uidFile);
+          this.logDebug(`Removed existing UID file: ${uidFile}`);
+        } catch (e) {
+          // Ignore errors if we can't delete it
+        }
+      }
 
       // Read and modify project.godot
       const projectGodotPath = join(projectPath, 'project.godot');
-      const originalContent = readFileSync(projectGodotPath, 'utf-8');
+      let content = readFileSync(projectGodotPath, 'utf-8');
 
-      // Check if autoload section exists
-      let modifiedContent: string;
-      const autoloadEntry = 'MCPScreenshot="*res://_mcp_screenshot_capture.gd"';
+      const autoloadEntry = 'MCPRuntimeBridge="*res://_mcp_runtime_bridge.gd"';
 
-      if (originalContent.includes('[autoload]')) {
+      // Remove ANY existing MCPRuntimeBridge entries to ensure we start clean and prevent duplication
+      // This also cleans up any mess left by previous buggy versions
+      content = content.replace(/^MCPRuntimeBridge\s*=\s*.*$/gm, '');
+
+      // Add our autoload entry
+      if (content.includes('[autoload]')) {
         // Add our autoload entry after the [autoload] section header
-        modifiedContent = originalContent.replace(
+        content = content.replace(
           /\[autoload\]\s*\n/,
           `[autoload]\n\n${autoloadEntry}\n`
         );
       } else {
         // No autoload section exists, add one at the end
-        modifiedContent = originalContent + `\n[autoload]\n\n${autoloadEntry}\n`;
+        content = content.trimEnd() + `\n\n[autoload]\n\n${autoloadEntry}\n`;
       }
 
       // Write the modified project.godot
-      writeFileSync(projectGodotPath, modifiedContent);
-      this.logDebug('Injected screenshot AutoLoad into project.godot');
+      writeFileSync(projectGodotPath, content);
+      this.logDebug('Injected runtime bridge AutoLoad into project.godot');
 
-      // Store injection state for cleanup
-      this.injectedAutoload = {
+      return {
         scriptPath: destScript,
         projectGodotPath,
-        projectGodotBackup: originalContent,
+        projectGodotBackup: '', // We use regex removal now instead of full restore
+        destScriptBase
       };
     } catch (error) {
-      this.logDebug(`Failed to inject screenshot autoload: ${error}`);
-      // Don't throw - screenshot capture just won't work, but project can still run
+      this.logDebug(`Failed to inject runtime autoload: ${error}`);
+      return null;
     }
   }
 
   /**
-   * Remove the injected screenshot capture AutoLoad from a project
+   * Remove the injected runtime bridge AutoLoad from a project
    */
-  private removeScreenshotAutoload(): void {
-    if (!this.injectedAutoload) {
+  private removeRuntimeAutoload(state: InjectedAutoload | null): void {
+    if (!state) {
       return;
     }
 
     try {
-      // Restore original project.godot
-      writeFileSync(
-        this.injectedAutoload.projectGodotPath,
-        this.injectedAutoload.projectGodotBackup
-      );
-      this.logDebug('Restored original project.godot');
+      // Remove the entry from project.godot
+      if (existsSync(state.projectGodotPath)) {
+        let content = readFileSync(state.projectGodotPath, 'utf-8');
+        // Remove all MCPRuntimeBridge entries
+        content = content.replace(/^MCPRuntimeBridge\s*=\s*.*$/gm, '');
+        // Clean up multiple newlines
+        content = content.replace(/\n\s*\n\s*\n/g, '\n\n');
+        writeFileSync(state.projectGodotPath, content.trimEnd() + '\n');
+        this.logDebug('Removed runtime bridge AutoLoad from project.godot');
+      }
 
-      // Delete the injected script
-      if (existsSync(this.injectedAutoload.scriptPath)) {
-        unlinkSync(this.injectedAutoload.scriptPath);
-        this.logDebug(`Deleted injected script: ${this.injectedAutoload.scriptPath}`);
+      // Delete the injected script and its UID file (Godot 4.4+)
+      if (existsSync(state.scriptPath)) {
+        unlinkSync(state.scriptPath);
+        this.logDebug(`Deleted injected script: ${state.scriptPath}`);
+
+        const uidFile = state.scriptPath + '.uid';
+        if (existsSync(uidFile)) {
+          unlinkSync(uidFile);
+          this.logDebug(`Deleted injected script UID file: ${uidFile}`);
+        }
       }
     } catch (error) {
-      this.logDebug(`Failed to clean up screenshot autoload: ${error}`);
-    } finally {
-      this.injectedAutoload = null;
+      this.logDebug(`Failed to clean up runtime autoload: ${error}`);
     }
   }
 
@@ -442,7 +465,7 @@ class GodotServer {
     // Check if this is an "at:" line following an error
     if (pendingLine) {
       const atMatch = trimmedLine.match(ERROR_PATTERNS.atLine) ||
-                      trimmedLine.match(ERROR_PATTERNS.atLineAlt);
+        trimmedLine.match(ERROR_PATTERNS.atLineAlt);
 
       if (atMatch) {
         const errorStartMatch = pendingLine.match(ERROR_PATTERNS.errorStart);
@@ -751,7 +774,9 @@ class GodotServer {
     this.logDebug('Cleaning up resources');
     if (this.activeProcess) {
       this.logDebug('Killing active Godot process');
+      const state = this.activeProcess.injectedAutoload;
       this.activeProcess.process.kill();
+      this.removeRuntimeAutoload(state);
       this.activeProcess = null;
     }
     await this.server.close();
@@ -781,18 +806,18 @@ class GodotServer {
     if (!params || typeof params !== 'object') {
       return params;
     }
-    
+
     const result: OperationParams = {};
-    
+
     for (const key in params) {
       if (Object.prototype.hasOwnProperty.call(params, key)) {
         let normalizedKey = key;
-        
+
         // If the key is in snake_case, convert it to camelCase using our mapping
         if (key.includes('_') && this.parameterMappings[key]) {
           normalizedKey = this.parameterMappings[key];
         }
-        
+
         // Handle nested objects recursively
         if (typeof params[key] === 'object' && params[key] !== null && !Array.isArray(params[key])) {
           result[normalizedKey] = this.normalizeParameters(params[key] as OperationParams);
@@ -801,7 +826,7 @@ class GodotServer {
         }
       }
     }
-    
+
     return result;
   }
 
@@ -812,12 +837,12 @@ class GodotServer {
    */
   private convertCamelToSnakeCase(params: OperationParams): OperationParams {
     const result: OperationParams = {};
-    
+
     for (const key in params) {
       if (Object.prototype.hasOwnProperty.call(params, key)) {
         // Convert camelCase to snake_case
         const snakeKey = this.reverseParameterMappings[key] || key.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`);
-        
+
         // Handle nested objects recursively
         if (typeof params[key] === 'object' && params[key] !== null && !Array.isArray(params[key])) {
           result[snakeKey] = this.convertCamelToSnakeCase(params[key] as OperationParams);
@@ -826,7 +851,7 @@ class GodotServer {
         }
       }
     }
-    
+
     return result;
   }
 
@@ -1508,6 +1533,78 @@ class GodotServer {
             required: ['projectPath', 'scriptPath'],
           },
         },
+        // Polled Input tool
+        {
+          name: 'send_input',
+          description: 'Send simulated inputs (keyboard, mouse, joypad) to the running game viewport. Requires game to be running via run_project first.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              inputs: {
+                type: 'array',
+                description: 'List of input events to simulate',
+                items: {
+                  type: 'object',
+                  properties: {
+                    type: {
+                      type: 'string',
+                      enum: ['key', 'mouse_button', 'mouse_motion', 'joy_button', 'joy_motion'],
+                      description: 'Type of input event',
+                    },
+                    action: {
+                      type: 'string',
+                      enum: ['press', 'release', 'click', 'move'],
+                      default: 'click',
+                      description: 'Action to perform. "click" performs press followed by release in the next frame.',
+                    },
+                    key: {
+                      type: 'string',
+                      description: 'Key name for "key" type (e.g., "W", "Escape", "Space")',
+                    },
+                    button: {
+                      type: 'string',
+                      description: 'Button name/index for "mouse_button" (left, right, middle, wheel_up, wheel_down) or "joy_button" (index)',
+                    },
+                    x: {
+                      type: 'number',
+                      description: 'X coordinate for mouse events',
+                    },
+                    y: {
+                      type: 'number',
+                      description: 'Y coordinate for mouse events',
+                    },
+                    relative_x: {
+                      type: 'number',
+                      description: 'Relative X for mouse motion',
+                    },
+                    relative_y: {
+                      type: 'number',
+                      description: 'Relative Y for mouse motion',
+                    },
+                    device: {
+                      type: 'number',
+                      description: 'Device ID for joypad events',
+                    },
+                    axis: {
+                      type: 'number',
+                      description: 'Axis index for joy_motion',
+                    },
+                    value: {
+                      type: 'number',
+                      description: 'Axis value (-1.0 to 1.0) for joy_motion',
+                    },
+                  },
+                  required: ['type'],
+                },
+              },
+            },
+            required: ['projectPath', 'inputs'],
+          },
+        },
         // Screenshot capture tool
         {
           name: 'capture_screenshot',
@@ -1602,6 +1699,9 @@ class GodotServer {
         // Validation tools
         case 'validate_script':
           return await this.handleValidateScript(request.params.arguments);
+        // Input simulation
+        case 'send_input':
+          return await this.handleSendInput(request.params.arguments);
         // Screenshot capture
         case 'capture_screenshot':
           return await this.handleCaptureScreenshot(request.params.arguments);
@@ -1621,7 +1721,7 @@ class GodotServer {
   private async handleLaunchEditor(args: any) {
     // Normalize parameters to camelCase
     args = this.normalizeParameters(args);
-    
+
     if (!args.projectPath) {
       return this.createErrorResponse(
         'Project path is required',
@@ -1700,7 +1800,7 @@ class GodotServer {
   private async handleRunProject(args: any) {
     // Normalize parameters to camelCase
     args = this.normalizeParameters(args);
-    
+
     if (!args.projectPath) {
       return this.createErrorResponse(
         'Project path is required',
@@ -1734,8 +1834,8 @@ class GodotServer {
         this.activeProcess.process.kill();
       }
 
-      // Inject screenshot capture AutoLoad before running
-      this.injectScreenshotAutoload(args.projectPath);
+      // Inject runtime bridge AutoLoad before running
+      const injectedAutoload = this.injectRuntimeAutoload(args.projectPath);
 
       const cmdArgs = ['-d', '--path', args.projectPath];
       if (args.scene && this.validatePath(args.scene)) {
@@ -1797,8 +1897,8 @@ class GodotServer {
 
       process.on('exit', (code: number | null) => {
         this.logDebug(`Godot process exited with code ${code}`);
-        // Clean up injected screenshot autoload
-        this.removeScreenshotAutoload();
+        // Clean up injected runtime autoload
+        this.removeRuntimeAutoload(injectedAutoload);
         if (this.activeProcess && this.activeProcess.process === process) {
           this.activeProcess = null;
         }
@@ -1811,7 +1911,7 @@ class GodotServer {
         }
       });
 
-      this.activeProcess = { process, output, errors, runtimeErrors, pendingErrorLine, debugMessages };
+      this.activeProcess = { process, output, errors, runtimeErrors, pendingErrorLine, debugMessages, injectedAutoload };
 
       return {
         content: [
@@ -1998,10 +2098,11 @@ class GodotServer {
     this.activeProcess.process.kill();
     const output = this.activeProcess.output;
     const errors = this.activeProcess.errors;
+    const state = this.activeProcess.injectedAutoload;
     this.activeProcess = null;
 
-    // Clean up injected screenshot autoload (in case exit handler didn't fire)
-    this.removeScreenshotAutoload();
+    // Clean up injected runtime autoload (in case exit handler didn't fire)
+    this.removeRuntimeAutoload(state);
 
     return {
       content: [
@@ -2068,7 +2169,7 @@ class GodotServer {
   private async handleListProjects(args: any) {
     // Normalize parameters to camelCase
     args = this.normalizeParameters(args);
-    
+
     if (!args.directory) {
       return this.createErrorResponse(
         'Directory is required',
@@ -2131,22 +2232,22 @@ class GodotServer {
 
         const scanDirectory = (currentPath: string) => {
           const entries = readdirSync(currentPath, { withFileTypes: true });
-          
+
           for (const entry of entries) {
             const entryPath = join(currentPath, entry.name);
-            
+
             // Skip hidden files and directories
             if (entry.name.startsWith('.')) {
               continue;
             }
-            
+
             if (entry.isDirectory()) {
               // Recursively scan subdirectories
               scanDirectory(entryPath);
             } else if (entry.isFile()) {
               // Count file by extension
               const ext = entry.name.split('.').pop()?.toLowerCase();
-              
+
               if (ext === 'tscn') {
                 structure.scenes++;
               } else if (ext === 'gd' || ext === 'gdscript' || ext === 'cs') {
@@ -2159,13 +2260,13 @@ class GodotServer {
             }
           }
         };
-        
+
         // Start scanning from the project root
         scanDirectory(projectPath);
         resolve(structure);
       } catch (error) {
         this.logDebug(`Error getting project structure asynchronously: ${error}`);
-        resolve({ 
+        resolve({
           error: 'Failed to get project structure',
           scenes: 0,
           scripts: 0,
@@ -2182,21 +2283,21 @@ class GodotServer {
   private async handleGetProjectInfo(args: any) {
     // Normalize parameters to camelCase
     args = this.normalizeParameters(args);
-    
+
     if (!args.projectPath) {
       return this.createErrorResponse(
         'Project path is required',
         ['Provide a valid path to a Godot project directory']
       );
     }
-  
+
     if (!this.validatePath(args.projectPath)) {
       return this.createErrorResponse(
         'Invalid project path',
         ['Provide a valid path without ".." or other potentially unsafe characters']
       );
     }
-  
+
     try {
       // Ensure godotPath is set
       if (!this.godotPath) {
@@ -2211,7 +2312,7 @@ class GodotServer {
           );
         }
       }
-  
+
       // Check if the project directory exists and contains a project.godot file
       const projectFile = join(args.projectPath, 'project.godot');
       if (!existsSync(projectFile)) {
@@ -2223,16 +2324,16 @@ class GodotServer {
           ]
         );
       }
-  
+
       this.logDebug(`Getting project info for: ${args.projectPath}`);
-  
+
       // Get Godot version
       const execOptions = { timeout: 10000 }; // 10 second timeout
       const { stdout } = await execAsync(`"${this.godotPath}" --version`, execOptions);
-  
+
       // Get project structure using the recursive method
       const projectStructure = await this.getProjectStructureAsync(args.projectPath);
-  
+
       // Extract project name from project.godot file
       let projectName = basename(args.projectPath);
       try {
@@ -2247,7 +2348,7 @@ class GodotServer {
         this.logDebug(`Error reading project file: ${error}`);
         // Continue with default project name if extraction fails
       }
-  
+
       return {
         content: [
           {
@@ -2415,8 +2516,8 @@ class GodotServer {
   private getDisplaySettings(config: Record<string, Record<string, string>>): object {
     const display = config['display'] || {};
     return {
-      width: this.parseGodotValue(display['window/size/viewport_width'] || '1152'),
-      height: this.parseGodotValue(display['window/size/viewport_height'] || '648'),
+      width: this.parseGodotValue(display['window/size/window_width_override'] || '0') || this.parseGodotValue(display['window/size/viewport_width'] || '1152'),
+      height: this.parseGodotValue(display['window/size/window_height_override'] || '0') || this.parseGodotValue(display['window/size/viewport_height'] || '648'),
       fullscreen: this.parseGodotValue(display['window/mode'] || '0') === 3,
       vsync: (this.parseGodotValue(display['window/vsync/vsync_mode'] || '1') as number) > 0,
       stretch_mode: this.parseGodotValue(display['window/stretch/mode'] || '"disabled"'),
@@ -2760,7 +2861,7 @@ class GodotServer {
   private async handleAddNode(args: any) {
     // Normalize parameters to camelCase
     args = this.normalizeParameters(args);
-    
+
     if (!args.projectPath || !args.scenePath || !args.nodeType || !args.nodeName) {
       return this.createErrorResponse(
         'Missing required parameters',
@@ -2856,7 +2957,7 @@ class GodotServer {
   private async handleLoadSprite(args: any) {
     // Normalize parameters to camelCase
     args = this.normalizeParameters(args);
-    
+
     if (!args.projectPath || !args.scenePath || !args.nodePath || !args.texturePath) {
       return this.createErrorResponse(
         'Missing required parameters',
@@ -2960,7 +3061,7 @@ class GodotServer {
   private async handleExportMeshLibrary(args: any) {
     // Normalize parameters to camelCase
     args = this.normalizeParameters(args);
-    
+
     if (!args.projectPath || !args.scenePath || !args.outputPath) {
       return this.createErrorResponse(
         'Missing required parameters',
@@ -3055,7 +3156,7 @@ class GodotServer {
   private async handleSaveScene(args: any) {
     // Normalize parameters to camelCase
     args = this.normalizeParameters(args);
-    
+
     if (!args.projectPath || !args.scenePath) {
       return this.createErrorResponse(
         'Missing required parameters',
@@ -3154,7 +3255,7 @@ class GodotServer {
   private async handleGetUid(args: any) {
     // Normalize parameters to camelCase
     args = this.normalizeParameters(args);
-    
+
     if (!args.projectPath || !args.filePath) {
       return this.createErrorResponse(
         'Missing required parameters',
@@ -3263,7 +3364,7 @@ class GodotServer {
   private async handleUpdateProjectUids(args: any) {
     // Normalize parameters to camelCase
     args = this.normalizeParameters(args);
-    
+
     if (!args.projectPath) {
       return this.createErrorResponse(
         'Project path is required',
@@ -3480,9 +3581,9 @@ class GodotServer {
           {
             type: 'text',
             text: `Connected to Godot debugger successfully.\n\n` +
-                  `DAP Server: ${host}:${dapPort}\n` +
-                  `MCP Bridge: ${host}:${bridgePort}\n\n` +
-                  `You can now use run_project_debug, get_breakpoints, get_call_stack, and get_local_variables.`,
+              `DAP Server: ${host}:${dapPort}\n` +
+              `MCP Bridge: ${host}:${bridgePort}\n\n` +
+              `You can now use run_project_debug, get_breakpoints, get_call_stack, and get_local_variables.`,
           },
         ],
       };
@@ -3548,7 +3649,7 @@ class GodotServer {
           {
             type: 'text',
             text: `Project started in debug mode.\n\nResponse: ${response}\n\n` +
-                  `Set breakpoints in the Godot editor, then use get_call_stack and get_local_variables when paused.`,
+              `Set breakpoints in the Godot editor, then use get_call_stack and get_local_variables when paused.`,
           },
         ],
       };
@@ -4298,6 +4399,98 @@ class GodotServer {
   }
 
   /**
+   * Handle the send_input tool
+   * Sends simulated inputs to the running game
+   */
+  private async handleSendInput(args: any) {
+    args = this.normalizeParameters(args);
+
+    if (!args.projectPath || !args.inputs) {
+      return this.createErrorResponse(
+        'Missing required parameters',
+        ['Provide projectPath and inputs array']
+      );
+    }
+
+    if (!this.validatePath(args.projectPath)) {
+      return this.createErrorResponse(
+        'Invalid project path',
+        ['Provide a valid path without ".." or other potentially unsafe characters']
+      );
+    }
+
+    if (!this.activeProcess) {
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            error: 'Game is not running. Start the game first with run_project.',
+          }, null, 2),
+        }],
+      };
+    }
+
+    try {
+      const userDataPath = this.getUserDataPath(args.projectPath);
+      if (!existsSync(userDataPath)) {
+        mkdirSync(userDataPath, { recursive: true });
+      }
+
+      const requestFile = join(userDataPath, 'mcp_input_request.json');
+      const statusFile = join(userDataPath, 'mcp_input_status.json');
+
+      if (existsSync(statusFile)) {
+        unlinkSync(statusFile);
+      }
+
+      writeFileSync(requestFile, JSON.stringify(args.inputs));
+      this.logDebug(`Wrote input request to ${requestFile}`);
+
+      // Poll for completion (optional, since inputs are usually fire-and-forget for the caller)
+      // But we wait a bit to ensure it's picked up
+      const timeout = 2000;
+      const pollInterval = 100;
+      const startTime = Date.now();
+
+      while (Date.now() - startTime < timeout) {
+        if (existsSync(statusFile)) {
+          const statusContent = readFileSync(statusFile, 'utf-8');
+          try {
+            const status = JSON.parse(statusContent);
+            unlinkSync(statusFile);
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify(status, null, 2),
+              }],
+            };
+          } catch {
+            await this.sleep(pollInterval);
+            continue;
+          }
+        }
+        await this.sleep(pollInterval);
+      }
+
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            note: 'Input request sent, but status confirmation timed out. The game likely processed it.',
+          }, null, 2),
+        }],
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to send input: ${error?.message || 'Unknown error'}`,
+        ['Ensure the game is running via run_project']
+      );
+    }
+  }
+
+  /**
    * Handle the capture_screenshot tool
    * Captures a screenshot from the running game viewport
    */
@@ -4433,17 +4626,24 @@ class GodotServer {
           }
 
           return {
-            content: [{
-              type: 'text',
-              text: JSON.stringify({
-                success: true,
-                image_base64: imageBase64,
-                format: meta.format,
-                width: meta.width,
-                height: meta.height,
-                source,
-              }, null, 2),
-            }],
+            content: [
+              {
+                type: 'image',
+                data: imageBase64,
+                mimeType: `image/${meta.format}`,
+              },
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  success: true,
+                  window_width: meta.window_width,
+                  window_height: meta.window_height,
+                  image_width: meta.image_width,
+                  image_height: meta.image_height,
+                  source,
+                }, null, 2),
+              },
+            ],
           };
         }
 
@@ -4465,7 +4665,7 @@ class GodotServer {
           text: JSON.stringify({
             success: false,
             source,
-            error: 'Screenshot capture timed out. Is the MCP screenshot AutoLoad active in the running game?',
+            error: 'Screenshot capture timed out. Is the MCP runtime bridge AutoLoad active in the running game?',
           }, null, 2),
         }],
       };
@@ -4510,8 +4710,6 @@ class GodotServer {
           console.warn('[SERVER] This fallback behavior will be removed in a future version. Set strictPathValidation: true to opt-in to the new behavior.');
         }
       }
-
-      console.log(`[SERVER] Using Godot at: ${this.godotPath}`);
 
       const transport = new StdioServerTransport();
       await this.server.connect(transport);
